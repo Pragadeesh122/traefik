@@ -1,0 +1,2 @@
+{"loadBalancer":{"servers":[{"url":"http://172.20.0.2:80"}],"strategy":"wrr","healthCheck":{"mode":"http","path":"/health","method":"GET","interval":"30s","timeout":"5s","followRedirects":true,"headers":{"custom":"foobar"}},"passHostHeader":true,"responseForwarding":{"flushInterval":"100ms"}},"status":"enabled","name":"myservice@docker","provider":"docker","type":"loadbalancer"}
+
