@@ -103,6 +103,10 @@ func rewriteRequestBuilder(target *url.URL, passHostHeader bool, preservePath bo
 
 		// If a plugin/middleware adds semicolons in query params, they should be urlEncoded.
 		pr.Out.URL.RawQuery = strings.ReplaceAll(u.RawQuery, ";", "&")
+		// ForceQuery is the only flag that keeps the trailing "?" of an empty query string,
+		// and the middleware chain may have rebuilt the URL and cleared it, so it is taken
+		// from the RequestURI, which is the authoritative view of what the client sent.
+		pr.Out.URL.ForceQuery = u.ForceQuery
 		pr.Out.RequestURI = "" // Outgoing request should not have RequestURI
 		// URL.RequestURI gives Opaque precedence over the path, an opaque outgoing URL would discard the path set above.
 		pr.Out.URL.Opaque = ""

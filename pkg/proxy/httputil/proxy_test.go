@@ -152,6 +152,49 @@ func Test_rewriteRequestBuilder(t *testing.T) {
 	}
 }
 
+func Test_rewriteRequestBuilder_emptyQueryString(t *testing.T) {
+	tests := []struct {
+		name               string
+		requestURI         string
+		expectedRequestURI string
+	}{
+		{
+			name:               "trailing question mark of an empty query string is kept",
+			requestURI:         "/posts/1?",
+			expectedRequestURI: "/posts/1?",
+		},
+		{
+			name:               "no question mark without a query string",
+			requestURI:         "/posts/1",
+			expectedRequestURI: "/posts/1",
+		},
+		{
+			name:               "non-empty query string is kept",
+			requestURI:         "/posts/1?a=b",
+			expectedRequestURI: "/posts/1?a=b",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			rewriteRequest := rewriteRequestBuilder(testhelpers.MustParseURL("http://example.com"), false, false)
+
+			reqIn := httptest.NewRequest(http.MethodGet, "http://localhost"+test.requestURI, http.NoBody)
+			reqOut := httptest.NewRequest(http.MethodGet, "http://localhost"+test.requestURI, http.NoBody)
+			// A middleware may have rebuilt the URL and cleared ForceQuery; the outgoing URL
+			// must still reflect the trailing "?" present in the RequestURI.
+			reqOut.URL.ForceQuery = false
+			reqOut.RequestURI = test.requestURI
+
+			rewriteRequest(&httputil.ProxyRequest{In: reqIn, Out: reqOut})
+
+			assert.Equal(t, test.expectedRequestURI, reqOut.URL.RequestURI())
+		})
+	}
+}
+
 func TestProxy_ConnectRejected(t *testing.T) {
 	testCases := []struct {
 		desc  string
