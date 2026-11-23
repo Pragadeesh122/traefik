@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/traefik/traefik/v3/pkg/config/dynamic"
 	"github.com/traefik/traefik/v3/pkg/provider/aggregator"
 	"github.com/traefik/traefik/v3/pkg/safe"
@@ -1040,4 +1041,271 @@ func TestEntryPointTLSResolvedOptions(t *testing.T) {
 	t.Cleanup(watcher.Stop)
 
 	<-run
+}
+
+// scriptedProvider provides the given messages, in order, then blocks until the test is
+// over.
+type scriptedProvider struct {
+	messages []dynamic.Message
+	interval time.Duration
+	block    chan struct{}
+}
+
+func (p *scriptedProvider) Provide(configurationChan chan<- dynamic.Message, _ *safe.Pool) error {
+	for i, message := range p.messages {
+		if i > 0 && p.interval > 0 {
+			time.Sleep(p.interval)
+		}
+
+		configurationChan <- message
+	}
+
+	<-p.block
+	return nil
+}
+
+func (p *scriptedProvider) Init() error { return nil }
+
+func TestWaitForReferencedProviders(t *testing.T) {
+	routinesPool := safe.NewPool(t.Context())
+	t.Cleanup(routinesPool.Stop)
+
+	// The configuration of the mock provider refers to the resources of the late
+	// provider, which provides them only after the required provider did.
+	mockConfig := &dynamic.Configuration{
+		HTTP: th.BuildConfiguration(
+			th.WithRouters(th.WithRouter("foo",
+				th.WithEntryPoints("ep"),
+				th.WithRouterMiddlewares("mw@late"),
+				th.WithServiceName("svc@late"))),
+		),
+	}
+
+	requiredConfig := &dynamic.Configuration{
+		HTTP: th.BuildConfiguration(
+			th.WithRouters(th.WithRouter("required", th.WithEntryPoints("ep"), th.WithServiceName("svc"))),
+			th.WithServices(th.WithService("svc", th.WithServiceServersLoadBalancer())),
+		),
+	}
+
+	lateConfig := &dynamic.Configuration{
+		HTTP: th.BuildConfiguration(
+			th.WithMiddlewares(th.WithMiddleware("mw", th.WithBasicAuth(&dynamic.BasicAuth{Users: []string{"test"}}))),
+			th.WithServices(th.WithService("svc", th.WithServiceServersLoadBalancer())),
+		),
+	}
+
+	pvd := &scriptedProvider{
+		messages: []dynamic.Message{
+			{ProviderName: "mock", Configuration: mockConfig},
+			{ProviderName: "required", Configuration: requiredConfig},
+			{ProviderName: "late", Configuration: lateConfig},
+		},
+		interval: 30 * time.Millisecond,
+		block:    make(chan struct{}),
+	}
+
+	watcher := NewConfigurationWatcher(routinesPool, pvd, []string{}, "required", false)
+
+	published := make(chan dynamic.Configuration, 10)
+	watcher.AddListener(func(conf dynamic.Configuration) { published <- conf })
+
+	watcher.Start()
+	t.Cleanup(watcher.Stop)
+	t.Cleanup(func() { close(pvd.block) })
+
+	select {
+	case conf := <-published:
+		// The configuration is applied in one shot, with the resources of the late
+		// provider, which the routers refer to.
+		assert.Contains(t, conf.HTTP.Routers, "foo@mock")
+		assert.Contains(t, conf.HTTP.Routers, "required@required")
+		assert.Contains(t, conf.HTTP.Middlewares, "mw@late")
+		assert.Contains(t, conf.HTTP.Services, "svc@late")
+	case <-time.After(2 * time.Second):
+		t.Fatal("the configuration was not applied")
+	}
+
+	select {
+	case <-published:
+		t.Fatal("a partial configuration was applied")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestDontWaitForUnreferencedProviders(t *testing.T) {
+	routinesPool := safe.NewPool(t.Context())
+	t.Cleanup(routinesPool.Stop)
+
+	// The silent provider never provides any configuration, and nothing refers to it:
+	// the configuration must not be delayed by it.
+	silent := &scriptedProvider{block: make(chan struct{})}
+
+	pvd := &scriptedProvider{
+		messages: []dynamic.Message{{
+			ProviderName: "required",
+			Configuration: &dynamic.Configuration{
+				HTTP: th.BuildConfiguration(
+					th.WithRouters(th.WithRouter("foo", th.WithEntryPoints("ep"), th.WithServiceName("svc"))),
+					th.WithServices(th.WithService("svc", th.WithServiceServersLoadBalancer())),
+				),
+			},
+		}},
+		block: make(chan struct{}),
+	}
+
+	providerAggregator := &aggregator.ProviderAggregator{}
+	require.NoError(t, providerAggregator.AddProvider(silent))
+	require.NoError(t, providerAggregator.AddProvider(pvd))
+
+	watcher := NewConfigurationWatcher(routinesPool, providerAggregator, []string{}, "required", false)
+
+	published := make(chan dynamic.Configuration, 10)
+	watcher.AddListener(func(conf dynamic.Configuration) { published <- conf })
+
+	watcher.Start()
+	t.Cleanup(watcher.Stop)
+	t.Cleanup(func() {
+		close(pvd.block)
+		close(silent.block)
+	})
+
+	select {
+	case conf := <-published:
+		assert.Contains(t, conf.HTTP.Routers, "foo@required")
+	case <-time.After(2 * time.Second):
+		t.Fatal("the configuration was not applied")
+	}
+}
+
+func TestApplyConfigurationWhenReferencedProviderHasNothingToProvide(t *testing.T) {
+	routinesPool := safe.NewPool(t.Context())
+	t.Cleanup(routinesPool.Stop)
+
+	// The referenced provider answers, with nothing to provide: the configuration is
+	// applied without waiting for the timeout, and the error of the missing middleware
+	// is left to the routers builders.
+	pvd := &scriptedProvider{
+		messages: []dynamic.Message{
+			{ProviderName: "mock", Configuration: &dynamic.Configuration{
+				HTTP: th.BuildConfiguration(
+					th.WithRouters(th.WithRouter("foo", th.WithEntryPoints("ep"), th.WithRouterMiddlewares("mw@empty"), th.WithServiceName("svc"))),
+					th.WithServices(th.WithService("svc", th.WithServiceServersLoadBalancer())),
+				),
+			}},
+			{ProviderName: "empty", Configuration: &dynamic.Configuration{}},
+		},
+		interval: 20 * time.Millisecond,
+		block:    make(chan struct{}),
+	}
+
+	watcher := NewConfigurationWatcher(routinesPool, pvd, []string{}, "", false)
+
+	published := make(chan dynamic.Configuration, 10)
+	watcher.AddListener(func(conf dynamic.Configuration) { published <- conf })
+
+	watcher.Start()
+	t.Cleanup(watcher.Stop)
+	t.Cleanup(func() { close(pvd.block) })
+
+	select {
+	case conf := <-published:
+		assert.Contains(t, conf.HTTP.Routers, "foo@mock")
+	case <-time.After(2 * time.Second):
+		t.Fatal("the configuration was not applied")
+	}
+}
+
+func TestInitialProvidersTimeout(t *testing.T) {
+	routinesPool := safe.NewPool(t.Context())
+	t.Cleanup(routinesPool.Stop)
+
+	// The provider which is referred to never provides any configuration.
+	pvd := &scriptedProvider{
+		messages: []dynamic.Message{{
+			ProviderName: "mock",
+			Configuration: &dynamic.Configuration{
+				HTTP: th.BuildConfiguration(
+					th.WithRouters(th.WithRouter("foo", th.WithEntryPoints("ep"), th.WithRouterMiddlewares("mw@silent"))),
+					th.WithServices(th.WithService("svc", th.WithServiceServersLoadBalancer())),
+				),
+			},
+		}},
+		block: make(chan struct{}),
+	}
+
+	watcher := NewConfigurationWatcher(routinesPool, pvd, []string{}, "", false)
+	watcher.providersTimeout = 50 * time.Millisecond
+
+	published := make(chan dynamic.Configuration, 10)
+	watcher.AddListener(func(conf dynamic.Configuration) { published <- conf })
+
+	watcher.Start()
+	t.Cleanup(watcher.Stop)
+	t.Cleanup(func() { close(pvd.block) })
+
+	select {
+	case conf := <-published:
+		assert.Contains(t, conf.HTTP.Routers, "foo@mock")
+	case <-time.After(2 * time.Second):
+		t.Fatal("the configuration was not applied")
+	}
+}
+
+func TestReferencedProviders(t *testing.T) {
+	configurations := dynamic.Configurations{
+		"internal": {
+			HTTP: &dynamic.HTTPConfiguration{
+				Models: map[string]*dynamic.Model{
+					"web": {Middlewares: []string{"entrypoint@file", "internal"}, TLS: &dynamic.RouterTLSConfig{Options: "options@file"}},
+				},
+				Routers: map[string]*dynamic.Router{
+					"dashboard": {Middlewares: []string{"mw@file"}, Service: "svc@file", ParentRefs: []string{"parent@gateway"}},
+					"ping":      {Middlewares: []string{"internal"}, Service: "internal"},
+				},
+				Services: map[string]*dynamic.Service{
+					"svc": {Middlewares: []string{"mw@file"}, LoadBalancer: &dynamic.ServersLoadBalancer{ServersTransport: "transport@file"}},
+					"weighted": {Weighted: &dynamic.WeightedRoundRobin{
+						Services: []dynamic.WRRService{{Name: "one@file"}, {Name: "internal"}},
+					}},
+					"mirrored": {Mirroring: &dynamic.Mirroring{
+						Service: "svc@file",
+						Mirrors: []dynamic.MirrorService{{Name: "mirror@file"}},
+					}},
+					"failed": {Failover: &dynamic.Failover{Service: "svc@file", Fallback: "fallback@file"}},
+				},
+				Middlewares: map[string]*dynamic.Middleware{
+					"mw":     {Chain: &dynamic.Chain{Middlewares: []string{"one@file", "internal"}}},
+					"errors": {Errors: &dynamic.ErrorPage{Service: "svc@file"}},
+				},
+			},
+			TCP: &dynamic.TCPConfiguration{
+				Routers: map[string]*dynamic.TCPRouter{
+					"routed": {Middlewares: []string{"mw@file"}, Service: "svc@file", TLS: &dynamic.RouterTCPTLSConfig{Options: "options@file"}},
+				},
+				Services: map[string]*dynamic.TCPService{
+					"svc":      {LoadBalancer: &dynamic.TCPServersLoadBalancer{ServersTransport: "transport@file"}},
+					"weighted": {Weighted: &dynamic.TCPWeightedRoundRobin{Services: []dynamic.TCPWRRService{{Name: "one@file"}}}},
+					"local":    {LoadBalancer: &dynamic.TCPServersLoadBalancer{}},
+				},
+			},
+			UDP: &dynamic.UDPConfiguration{
+				Routers: map[string]*dynamic.UDPRouter{"routed": {Service: "svc@file"}},
+				Services: map[string]*dynamic.UDPService{
+					"weighted": {Weighted: &dynamic.UDPWeightedRoundRobin{Services: []dynamic.UDPWRRService{{Name: "one@file"}}}},
+				},
+			},
+		},
+		"file": {
+			HTTP: &dynamic.HTTPConfiguration{
+				Routers: map[string]*dynamic.Router{
+					// The references to the provider itself, qualified or not, are not
+					// dependencies on another provider.
+					"router": {Middlewares: []string{"mw", "mw@file"}, Service: "svc@file"},
+				},
+			},
+		},
+	}
+
+	assert.Equal(t, []string{"file", "gateway"}, referencedProviders(configurations))
 }
