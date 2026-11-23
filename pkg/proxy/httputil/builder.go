@@ -44,6 +44,10 @@ func (r *ProxyBuilder) Build(cfgName string, targetURL *url.URL, passHostHeader,
 		return nil, fmt.Errorf("getting RoundTripper: %w", err)
 	}
 
+	// Wrapping the roundTripper so a request-body read failure is told apart from a backend
+	// failure, before the error reaches the ErrorHandler through the reverse proxy.
+	roundTripper = &clientBodyErrorRoundTripper{next: roundTripper}
+
 	// Wrapping the roundTripper with the Tracing roundTripper,
 	// to create, if necessary, the reverseProxy client span and the semConv client metric.
 	roundTripper = newObservabilityRoundTripper(r.semConvMetricsRegistry, roundTripper)
