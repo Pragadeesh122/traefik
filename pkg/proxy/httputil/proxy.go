@@ -11,6 +11,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -181,6 +182,78 @@ func isWebSocketUpgrade(req *http.Request) bool {
 		strings.EqualFold(req.Header.Get("Upgrade"), "websocket")
 }
 
+// clientBodyError marks a transport failure caused by an error raised while reading the incoming
+// request body — a faulty client request, such as an HTTP/2 stream ending before the Content-Length
+// it declares — rather than a backend failure. The transport wraps such a read error the same way it
+// wraps a connection error to the backend (a net.Error), so without this marker ComputeStatusCode
+// cannot tell a client error, which deserves a 400, from an unreachable backend, which deserves a 502.
+type clientBodyError struct {
+	err error
+}
+
+func (e *clientBodyError) Error() string { return e.err.Error() }
+
+func (e *clientBodyError) Unwrap() error { return e.err }
+
+// clientBodyErrorRoundTripper annotates RoundTrip failures whose cause is the incoming request body:
+// it watches the body while the transport streams it to the backend and, when the transport fails
+// after the body itself failed, returns a clientBodyError instead of the bare transport error.
+type clientBodyErrorRoundTripper struct {
+	next http.RoundTripper
+}
+
+func (r *clientBodyErrorRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Body == nil || req.Body == http.NoBody {
+		return r.next.RoundTrip(req)
+	}
+
+	tracker := &requestBodyTracker{ReadCloser: req.Body}
+
+	tracked := *req
+	tracked.Body = tracker
+
+	resp, err := r.next.RoundTrip(&tracked)
+	if err != nil && tracker.failedByClient() {
+		return nil, &clientBodyError{err}
+	}
+	return resp, err
+}
+
+// requestBodyTracker records the first error the underlying request body raises on read, if any.
+type requestBodyTracker struct {
+	io.ReadCloser
+
+	mu  sync.Mutex
+	err error
+}
+
+func (b *requestBodyTracker) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		b.mu.Lock()
+		if b.err == nil {
+			b.err = err
+		}
+		b.mu.Unlock()
+	}
+	return n, err
+}
+
+// failedByClient reports whether the body failed on its own, as opposed to being torn down around
+// a canceled or timed-out request: those keep their current status codes (499, 504).
+func (b *requestBodyTracker) failedByClient() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.err == nil || errors.Is(b.err, context.Canceled) {
+		return false
+	}
+	if netErr, ok := errors.AsType[net.Error](b.err); ok && netErr.Timeout() {
+		return false
+	}
+	return true
+}
+
 // ErrorHandler is the http.Handler called when something goes wrong when forwarding the request.
 func ErrorHandler(w http.ResponseWriter, req *http.Request, err error) {
 	ErrorHandlerWithContext(req.Context(), w, err)
@@ -235,6 +308,10 @@ func ComputeStatusCode(err error) int {
 	case errors.Is(err, context.Canceled):
 		return StatusClientClosedRequest
 	default:
+		if _, ok := errors.AsType[*clientBodyError](err); ok {
+			return http.StatusBadRequest
+		}
+
 		if netErr, ok := errors.AsType[net.Error](err); ok {
 			if netErr.Timeout() {
 				return http.StatusGatewayTimeout
