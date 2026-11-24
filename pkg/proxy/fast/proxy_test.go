@@ -302,6 +302,64 @@ func TestPreservePath(t *testing.T) {
 	assert.Equal(t, http.StatusOK, res.Code)
 }
 
+// TestEmptyQueryString checks that the trailing "?" of an empty query string reaches the backend,
+// even when a middleware has rebuilt the request URL and cleared the ForceQuery flag.
+func TestEmptyQueryString(t *testing.T) {
+	tests := []struct {
+		name               string
+		requestURI         string
+		expectedRequestURI string
+	}{
+		{
+			name:               "trailing question mark of an empty query string is kept",
+			requestURI:         "/posts/1?",
+			expectedRequestURI: "/posts/1?",
+		},
+		{
+			name:               "no question mark without a query string",
+			requestURI:         "/posts/1",
+			expectedRequestURI: "/posts/1",
+		},
+		{
+			name:               "non-empty query string is kept",
+			requestURI:         "/posts/1?a=b",
+			expectedRequestURI: "/posts/1?a=b",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			var callCount int
+			var got string
+			server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+				callCount++
+				got = req.RequestURI
+			}))
+			t.Cleanup(server.Close)
+
+			builder := NewProxyBuilder(&transportManagerMock{}, static.FastProxyConfig{})
+
+			proxyHandler, err := builder.Build("", testhelpers.MustParseURL(server.URL), true, false)
+			require.NoError(t, err)
+
+			req := httptest.NewRequest(http.MethodGet, "http://localhost"+test.requestURI, http.NoBody)
+			// A middleware may have rebuilt the URL and cleared ForceQuery; the outgoing request
+			// must still reflect the trailing "?" present in the RequestURI.
+			req.URL.ForceQuery = false
+			req.RequestURI = test.requestURI
+			res := httptest.NewRecorder()
+
+			proxyHandler.ServeHTTP(res, req)
+
+			assert.Equal(t, 1, callCount)
+			assert.Equal(t, http.StatusOK, res.Code)
+			assert.Equal(t, test.expectedRequestURI, got)
+		})
+	}
+}
+
 func TestOpaqueRequestURL(t *testing.T) {
 	var callCount int
 	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {

@@ -218,6 +218,10 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	u2.RawQuery = strings.ReplaceAll(u.RawQuery, ";", "&")
+	// ForceQuery is the only flag that keeps the trailing "?" of an empty query string,
+	// and the middleware chain may have rebuilt the URL and cleared it, so it is taken
+	// from the RequestURI, which is the authoritative view of what the client sent.
+	u2.ForceQuery = u.ForceQuery
 	// URL.RequestURI gives Opaque precedence over the path, an opaque outgoing URL would discard the path set above.
 	u2.Opaque = ""
 
