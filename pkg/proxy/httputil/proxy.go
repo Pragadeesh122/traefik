@@ -227,6 +227,27 @@ func isTLSConfigError(err error) bool {
 	return ok
 }
 
+// contentLengthMismatch is the error message with which the Go HTTP/2 server closes an inbound
+// request body when END_STREAM arrives before the declared number of body bytes
+// (net/http/internal/http2/server.go, (*stream).endStream). The error is not exported, so
+// matching its text is the only way to recognize a client that sent fewer body bytes than it
+// declared. When the copy of the inbound body to the backend fails, the servers transport
+// surfaces it in two shapes, and both are accepted: wrapped in a "readfrom" *net.OpError over a
+// cleartext backend connection (the TCP ReadFrom fast path re-wraps the body read error), and
+// unwrapped, message only, over a TLS backend connection, where there is no ReadFrom fast path.
+const contentLengthMismatch = "request declared a Content-Length of "
+
+// isContentLengthMismatch reports whether the error comes from reading a request body that the
+// inbound HTTP/2 server closed because fewer bytes were written than the declared Content-Length.
+func isContentLengthMismatch(err error) bool {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "readfrom" {
+		err = opErr.Err
+	}
+
+	return err != nil && strings.HasPrefix(err.Error(), contentLengthMismatch)
+}
+
 // ComputeStatusCode computes the HTTP status code according to the given error.
 func ComputeStatusCode(err error) int {
 	switch {
@@ -234,6 +255,8 @@ func ComputeStatusCode(err error) int {
 		return http.StatusBadGateway
 	case errors.Is(err, context.Canceled):
 		return StatusClientClosedRequest
+	case isContentLengthMismatch(err):
+		return http.StatusBadRequest
 	default:
 		if netErr, ok := errors.AsType[net.Error](err); ok {
 			if netErr.Timeout() {
